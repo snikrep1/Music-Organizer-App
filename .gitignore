@@ -1,0 +1,59 @@
+# Build artefacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.manifest
+
+# App-generated
+MusicOrganizer-Backups/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Internal planning / design docs (not part of the shipped program)
+MUSIC_ORGANIZER_SPEC.md
+
+# AI assistant context files / configs — never commit these
+CLAUDE.md
+CLAUDE.local.md
+claude.md
+AGENTS.md
+agents.md
+GEMINI.md
+gemini.md
+COPILOT.md
+copilot.md
+copilot-instructions.md
+.github/copilot-instructions.md
+.cursorrules
+.cursorignore
+.windsurfrules
+.aider-instructions
+.aiderules
+.airules
+.ai-rules
+.ai-instructions
+*.ai-context.md
+*-ai-context.md
+*.claude-context.md
+.claude/
+.cursor/
+.aider/
+.continue/
+.codeium/
+.windsurf/
+.openai/
+.anthropic/
+.ai/
+.tabnine/
+.kite/
+.copilot/
+.aider.chat.history.md
+.aider.input.history
+.aider.tags.cache.v3/
+.aider.llm.history
