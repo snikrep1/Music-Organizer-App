@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Music Organizer
+GenericName=Music Tag & Library Manager
+Comment=Edit music tags and organize your library into a clean folder structure
+Exec=music-organizer
+Icon=music-organizer
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+Keywords=music;tags;tagging;metadata;id3;flac;mp3;organize;library;
+StartupNotify=true
+StartupWMClass=music-organizer

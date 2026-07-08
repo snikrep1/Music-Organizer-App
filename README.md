@@ -104,9 +104,30 @@ Output lands in `dist/`:
 | macOS    | `dist/MusicOrganizer.app` |
 | Linux    | `dist/music-organizer` |
 
-PyInstaller can't cross-compile — build each platform on its own OS, or use a
-CI matrix (see the photo-organizer project's `.github/workflows/build.yml` for
-a template).
+PyInstaller can't cross-compile — build each platform on its own OS, or use the
+GitHub Actions workflow in `.github/workflows/build.yml`, which builds all three
+platforms on a `v*` tag and publishes a release.
+
+## Install (from a release)
+
+Grab the latest build from the [Releases](../../releases) page.
+
+- **Windows** — download `MusicOrganizer.exe` and run it (SmartScreen: *More
+  info → Run anyway*).
+- **macOS** — download `MusicOrganizer-macos.zip`, double-click to unzip, then
+  right-click `MusicOrganizer.app` → *Open* the first time (unsigned app).
+- **Linux** — download `music-organizer-linux.tar.gz`, then:
+
+  ```bash
+  tar -xzf music-organizer-linux.tar.gz
+  cd music-organizer-linux
+  ./install.sh        # installs to ~/.local, adds an app-menu entry + icon
+  ```
+
+  "Music Organizer" then appears in your application menu with its icon.
+  Run `./uninstall.sh` (or delete `~/.local/bin/music-organizer`, the
+  `hicolor` icons, and `~/.local/share/applications/music-organizer.desktop`)
+  to remove it.
 
 ## How to use
 

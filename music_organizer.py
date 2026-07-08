@@ -32,7 +32,13 @@ from PyQt6.QtWidgets import (
     QTabWidget,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QColor, QBrush, QPixmap
+from PyQt6.QtGui import QColor, QBrush, QPixmap, QIcon
+
+
+def resource_path(rel: str) -> str:
+    """Resolve a bundled resource both when frozen (PyInstaller) and from source."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
 
 # ── Tag library ───────────────────────────────────────────────────────────────
 
@@ -2585,7 +2591,15 @@ QDialogButtonBox QPushButton { min-width: 80px; }
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Music Organizer")
+    # Associates the window with the installed .desktop entry on Linux
+    # (Wayland/GNOME use this to show the correct taskbar icon).
+    app.setDesktopFileName("music-organizer")
     app.setStyle("Fusion")
+
+    # App/window/dock icon (also covers Linux, where the executable has no icon).
+    icon_file = resource_path(os.path.join("assets", "MusicOrganizer.png"))
+    if os.path.exists(icon_file):
+        app.setWindowIcon(QIcon(icon_file))
 
     stylesheet = FLEXOKI_STYLESHEET
     try:

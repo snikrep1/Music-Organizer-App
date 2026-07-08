@@ -8,11 +8,18 @@ from pathlib import Path
 block_cipher = None
 HERE = Path(SPECPATH)
 
+ASSETS = HERE / 'assets'
+ICON_ICNS = str(ASSETS / 'MusicOrganizer.icns')   # macOS
+ICON_ICO = str(ASSETS / 'MusicOrganizer.ico')     # Windows
+ICON_PNG = str(ASSETS / 'MusicOrganizer.png')     # runtime window/dock icon (all OSes)
+
 a = Analysis(
     ['music_organizer.py'],
     pathex=[str(HERE)],
     binaries=[],
-    datas=[],
+    # Bundle the PNG so the app can set its window/taskbar icon at runtime
+    # (this is what gives Linux a dock icon, since ELF icons aren't a thing).
+    datas=[(ICON_PNG, 'assets')],
     # mutagen loads format modules lazily; pull them all in so no format is
     # dropped from the frozen build.
     hiddenimports=[
@@ -53,11 +60,11 @@ if sys.platform == 'darwin':
     app = BUNDLE(
         coll,
         name='MusicOrganizer.app',
-        icon=None,
+        icon=ICON_ICNS,
         bundle_identifier='com.guy.musicorganizer',
         info_plist={
-            'CFBundleShortVersionString': '0.2.1',
-            'CFBundleVersion': '0.2.1',
+            'CFBundleShortVersionString': '0.3.0',
+            'CFBundleVersion': '0.3.0',
             'NSHighResolutionCapable': 'True',
             'NSPrincipalClass': 'NSApplication',
         },
@@ -66,6 +73,7 @@ else:
     exe = EXE(
         pyz, a.scripts, a.binaries, a.zipfiles, a.datas, [],
         name='MusicOrganizer' if sys.platform == 'win32' else 'music-organizer',
+        icon=ICON_ICO if sys.platform == 'win32' else None,
         debug=False, bootloader_ignore_signals=False, strip=False, upx=False,
         upx_exclude=[], runtime_tmpdir=None,
         console=False, disable_windowed_traceback=False,

@@ -16,7 +16,7 @@ jobs:
         include:
           - os: ubuntu-latest
             artifact_name: music-organizer-linux
-            artifact_path: dist/music-organizer
+            artifact_path: music-organizer-linux.tar.gz
           - os: windows-latest
             artifact_name: music-organizer-windows
             artifact_path: dist/MusicOrganizer.exe
@@ -62,6 +62,18 @@ jobs:
           codesign --verify --verbose=2 dist/MusicOrganizer.app || true
           cd dist
           ditto -c -k --sequesterRsrc --keepParent MusicOrganizer.app MusicOrganizer-macos.zip
+
+      # Ship Linux as a tarball with the binary + icons + .desktop + installer,
+      # so users get proper app-menu and icon integration via install.sh.
+      - name: Package Linux tarball
+        if: runner.os == 'Linux'
+        run: |
+          stage="music-organizer-linux"
+          mkdir -p "$stage"
+          cp dist/music-organizer "$stage/"
+          cp -r packaging/* "$stage/"
+          chmod +x "$stage/music-organizer" "$stage/install.sh" "$stage/uninstall.sh"
+          tar -czf music-organizer-linux.tar.gz "$stage"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
