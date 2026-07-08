@@ -1,0 +1,82 @@
+name: Build and Release
+
+on:
+  push:
+    tags: ['v*']       # e.g. v0.1.0 — builds all platforms and publishes a release
+  workflow_dispatch:    # also runnable manually from the Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: music-organizer-linux
+            artifact_path: dist/music-organizer
+          - os: windows-latest
+            artifact_name: music-organizer-windows
+            artifact_path: dist/MusicOrganizer.exe
+          - os: macos-latest
+            artifact_name: music-organizer-macos
+            artifact_path: dist/MusicOrganizer-macos.zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Linux system libs (for Qt)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libegl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-sync1 libxcb-xfixes0 libxcb-xinerama0 libxcb-xkb1
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller PyQt6 mutagen
+
+      - name: Build
+        run: python build.py
+
+      - name: Zip .app bundle (macOS)
+        if: runner.os == 'macOS'
+        run: cd dist && zip -r MusicOrganizer-macos.zip MusicOrganizer.app
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
+          fail_on_unmatched_files: false

@@ -37,21 +37,38 @@ Organize (file operations)
 
 ### Organize tab — file operations
 
-- **Move into a folder structure** from a naming pattern, or **Rename in place**
-  without moving files out of their folder.
-- **Pattern tokens**: `%albumartist%`, `%artist%`, `%album%`, `%title%`,
-  `%tracknumber%`, `%discnumber%`, `%year%`, `%genre%`. A `/` in the pattern
-  starts a new subfolder; the file extension is preserved automatically. Track
-  numbers are zero-padded to two digits, and missing fields fall back to
-  sensible defaults (e.g. *Unknown Artist*). Default pattern:
-  `%albumartist%/[%year%] %album%/%tracknumber% - %title%`.
+- **Move**, **Copy**, or **Rename in place** — build a clean library into a new
+  folder structure (Move/Copy), or just rename files where they sit.
+- **Pattern language** (foobar2000-style):
+  - **Fields**: `%albumartist%`, `%artist%`, `%album%`, `%title%`,
+    `%tracknumber%`, `%discnumber%`, `%year%`, `%genre%`.
+  - **Optional sections**: `[ … ]` is dropped entirely when the fields inside
+    it are empty — so an untagged file gets no stray `[Unknown Year]` folder.
+  - **Literals**: text in `'single quotes'` is inserted verbatim (use `'['` for
+    a literal bracket).
+  - **Functions**: `$num(n,len)` (zero-pad), `$if(x,then,else)`, `$if2(x,else)`,
+    `$upper(x)`, `$lower(x)`, `$replace(x,from,to)`, `$left(x,n)`.
+  - A `/` starts a new subfolder; the file extension is preserved. Default
+    pattern: `%albumartist%/['['%year%'] ']%album%/$num(%tracknumber%,2) - %title%`.
 - **Live preview** of every current → new path, with **conflict detection**
   (two files targeting the same path, or an existing file in the way) that
   blocks the run until resolved.
 - **Remove empty source folders** after moving.
-- **Undo last organize** — moves every file back to where it came from.
+- **Undo last organize** — moves files back (or deletes the copies).
 - Organizing uses the *current* tag values shown in the table, so fixes you
   make on the Tags tab flow straight into the folder names.
+
+### Duplicates tab — find & clean up
+
+- **Detect duplicates** by tags (Artist + Title, optionally + Album) or by
+  **identical file content** (byte-for-byte hash).
+- Each group **auto-picks a keeper** (most complete tags, then largest file);
+  select any row and **Keep Selected Instead** to override.
+- **Quarantine** the non-keepers by moving them to a separate folder (not
+  deleted) so you can review before removing. **Undo** moves them back.
+
+### Throughout
+
 - **Folder include/exclude** with a checkbox tree, including nested subfolders.
 - **Stop scanning** mid-scan if you picked the wrong folder.
 - **Per-row reset** — right-click a row to revert it to its original tags.

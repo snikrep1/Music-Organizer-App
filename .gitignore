@@ -10,6 +10,7 @@ venv/
 
 # App-generated
 MusicOrganizer-Backups/
+MusicOrganizer-Duplicates/
 
 # OS cruft
 .DS_Store

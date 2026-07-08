@@ -15,6 +15,7 @@ import base64
 import shutil
 import struct
 import zlib
+import hashlib
 import tempfile
 import subprocess
 from datetime import datetime
@@ -282,76 +283,224 @@ PATTERN_TOKENS = [
     "%albumartist%", "%artist%", "%album%", "%title%",
     "%tracknumber%", "%discnumber%", "%year%", "%genre%",
 ]
+# Title-formatting functions supported inside patterns.
+PATTERN_FUNCS = ["$num(n,len)", "$if(x,then,else)", "$if2(x,else)",
+                 "$upper(x)", "$lower(x)", "$replace(x,from,to)", "$left(x,n)"]
 
-DEFAULT_PATTERN = "%albumartist%/[%year%] %album%/%tracknumber% - %title%"
+DEFAULT_PATTERN = "%albumartist%/['['%year%'] ']%album%/$num(%tracknumber%,2) - %title%"
 
 _ILLEGAL_CHARS = '<>:"/\\|?*'
 _ILLEGAL_TABLE = {ord(c): "_" for c in _ILLEGAL_CHARS}
 _ILLEGAL_TABLE.update({i: "_" for i in range(32)})  # control chars
 
+# Defaults used only for a bare (non-bracketed) field that resolves empty, so a
+# path segment is never blank. Inside [...] an empty field just hides the section.
+_FIELD_DEFAULTS = {
+    "albumartist": "Unknown Artist", "artist": "Unknown Artist",
+    "album": "Unknown Album", "title": "Untitled",
+    "tracknumber": "00", "track": "00", "discnumber": "1", "disc": "1",
+    "year": "Unknown Year", "date": "Unknown Year", "genre": "Unknown Genre",
+}
 
-def sanitize_component(value: str) -> str:
-    """Make one path segment safe on Windows and macOS."""
-    value = (value or "").translate(_ILLEGAL_TABLE)
-    value = " ".join(value.split())          # collapse whitespace
-    value = value.strip().rstrip(". ")        # Windows dislikes trailing dot/space
-    return value or "_"
+
+def _clean_value(value: str) -> str:
+    """Neutralize path separators / illegal chars inside a field value."""
+    return (value or "").translate(_ILLEGAL_TABLE)
+
+
+def _clean_segment(value: str) -> str:
+    """Final safety pass on one path segment. '' if the segment is empty."""
+    if not value.strip():
+        return ""
+    v = value.translate(_ILLEGAL_TABLE)
+    v = " ".join(v.split()).strip().rstrip(". ")
+    return v or "_"
 
 
 def _first_number(value: str) -> str:
     """'3/12' -> '3', '07' -> '7'; non-numeric returned stripped."""
-    head = (value or "").split("/")[0].strip()
-    return head
+    return (value or "").split("/")[0].strip()
 
 
-def resolve_token(token: str, tags: dict, stem_fallback: str) -> str:
-    t = token.strip("%").lower()
+def _format_field(name: str, tags: dict, stem: str) -> str:
+    """Raw value for a field (no defaults). '' means the tag is absent."""
+    t = name.lower()
     g = lambda k: (tags.get(k) or "").strip()
     if t == "albumartist":
-        return g("albumartist") or g("artist") or "Unknown Artist"
+        return g("albumartist") or g("artist")
     if t == "artist":
-        return g("artist") or g("albumartist") or "Unknown Artist"
+        return g("artist") or g("albumartist")
     if t == "album":
-        return g("album") or "Unknown Album"
+        return g("album")
     if t == "title":
-        return g("title") or stem_fallback or "Untitled"
+        return g("title") or stem
     if t in ("tracknumber", "track"):
-        n = _first_number(g("tracknumber"))
-        return n.zfill(2) if n.isdigit() else (n or "00")
+        return _first_number(g("tracknumber"))
     if t in ("discnumber", "disc"):
-        n = _first_number(g("discnumber"))
-        return n or "1"
+        return _first_number(g("discnumber"))
     if t in ("year", "date"):
         d = g("date")
-        return d[:4] if d[:4].isdigit() else (d or "Unknown Year")
+        return d[:4] if d[:4].isdigit() else d
     if t == "genre":
-        return g("genre") or "Unknown Genre"
-    return ""  # unknown token → empty
+        return g("genre")
+    return ""
+
+
+# ── Pattern parser (nodes) ────────────────────────────────────────────────────
+# Node kinds: ("lit", text) | ("field", name) | ("opt", [nodes])
+#             | ("func", name, [ [nodes], ... ])
+
+def _parse_seq(s: str, i: int, stops: str):
+    nodes, buf, n = [], [], len(s)
+
+    def flush():
+        if buf:
+            nodes.append(("lit", "".join(buf)))
+            buf.clear()
+
+    while i < n:
+        c = s[i]
+        if c in stops:
+            break
+        if c == "'":                      # quoted literal ('' -> literal ')
+            j, out = i + 1, []
+            while j < n:
+                if s[j] == "'":
+                    if j + 1 < n and s[j + 1] == "'":
+                        out.append("'"); j += 2; continue
+                    j += 1; break
+                out.append(s[j]); j += 1
+            buf.append("".join(out)); i = j; continue
+        if c == "%":
+            j = s.find("%", i + 1)
+            if j == -1:
+                buf.append(c); i += 1; continue
+            flush(); nodes.append(("field", s[i + 1:j])); i = j + 1; continue
+        if c == "[":
+            flush()
+            child, i2 = _parse_seq(s, i + 1, "]")
+            if i2 < n and s[i2] == "]":
+                i2 += 1
+            nodes.append(("opt", child)); i = i2; continue
+        if c == "$":
+            m, name = i + 1, []
+            while m < n and (s[m].isalnum() or s[m] == "_"):
+                name.append(s[m]); m += 1
+            if m < n and s[m] == "(":
+                flush(); m += 1; args = []
+                while True:
+                    arg, m = _parse_seq(s, m, ",)")
+                    args.append(arg)
+                    if m < n and s[m] == ",":
+                        m += 1; continue
+                    if m < n and s[m] == ")":
+                        m += 1
+                    break
+                nodes.append(("func", "".join(name), args)); i = m; continue
+            buf.append(c); i += 1; continue
+        buf.append(c); i += 1
+    flush()
+    return nodes, i
+
+
+def parse_pattern(s: str):
+    nodes, _ = _parse_seq(s, 0, "")
+    return nodes
+
+
+def _eval_nodes(nodes, ctx, optional):
+    parts, present_any = [], False
+    for node in nodes:
+        text, present = _eval_node(node, ctx, optional)
+        parts.append(text)
+        present_any = present_any or present
+    return "".join(parts), present_any
+
+
+def _eval_node(node, ctx, optional):
+    kind = node[0]
+    if kind == "lit":
+        return node[1], False
+    if kind == "field":
+        name = node[1].lower()
+        raw = _clean_value(_format_field(name, ctx["tags"], ctx["stem"]))
+        if raw:
+            return raw, True
+        return ("" if optional else _FIELD_DEFAULTS.get(name, "")), False
+    if kind == "opt":
+        text, present = _eval_nodes(node[1], ctx, True)
+        return (text, True) if present else ("", False)
+    if kind == "func":
+        return _eval_func(node[1], node[2], ctx, optional)
+    return "", False
+
+
+def _eval_func(name, args, ctx, optional):
+    name = name.lower()
+
+    # Fields inside function args never take their fallback defaults, so tests
+    # like $if(%genre%,...) correctly see an absent tag as empty.
+    def val(idx):
+        if idx >= len(args):
+            return "", False
+        return _eval_nodes(args[idx], ctx, True)
+
+    if name == "num":
+        x, _ = val(0); nstr, _ = val(1)
+        try:
+            width = int(nstr.strip())
+        except ValueError:
+            width = 0
+        xs = x.strip()
+        if xs.isdigit():
+            return xs.zfill(width), True
+        if xs == "":
+            return "0".zfill(width), False   # empty number -> zero-padded 0
+        return xs, True                       # non-numeric passthrough
+    if name == "if":
+        cond, cp = val(0)
+        return val(1) if (cond.strip() or cp) else val(2)
+    if name == "if2":
+        a, ap = val(0)
+        return (a, ap) if (a.strip() or ap) else val(1)
+    if name == "upper":
+        x, p = val(0); return x.upper(), p
+    if name == "lower":
+        x, p = val(0); return x.lower(), p
+    if name == "replace":
+        x, p = val(0); a, _ = val(1); b, _ = val(2)
+        return (x.replace(a, b) if a else x), p
+    if name == "left":
+        x, p = val(0); ns, _ = val(1)
+        try:
+            k = int(ns.strip())
+        except ValueError:
+            k = len(x)
+        return x[:k], p
+    return "", False
 
 
 def render_pattern(pattern: str, tags: dict, stem_fallback: str) -> str:
     """Render a pattern into a relative path (no extension).
 
-    '/' and '\\' in the pattern are literal path separators; token *values* have
-    their own separators/illegal chars sanitized so they can't escape a segment.
+    Supports %fields%, [optional sections that vanish when their fields are
+    empty], 'literal text', and $functions. Literal '/' separates folders;
+    field values have their own separators sanitized so they can't escape a
+    segment.
     """
-    import re
-
-    def repl(m):
-        return sanitize_component(resolve_token(m.group(0), tags, stem_fallback))
-
-    rendered = re.sub(r"%[a-zA-Z_]+%", repl, pattern)
-    rendered = rendered.replace("\\", "/")
-    segments = [sanitize_component(s) for s in rendered.split("/") if s.strip()]
+    ctx = {"tags": tags, "stem": (stem_fallback or "").strip()}
+    text, _ = _eval_nodes(parse_pattern(pattern), ctx, optional=False)
+    text = text.replace("\\", "/")
+    segments = [seg for seg in (_clean_segment(s) for s in text.split("/")) if seg]
     return "/".join(segments) if segments else "Untitled"
 
 
 def build_organize_plan(tracks, mode, target_root, pattern):
     """Return a list of dicts: {src, dest, changed, conflict}.
 
-    mode: 'move' (into target_root/<pattern>) or 'rename' (pattern basename in
-    the file's own folder). Conflicts = two sources → same dest, or dest already
-    exists on disk as a different file.
+    mode: 'move'/'copy' (into target_root/<pattern>) or 'rename' (pattern
+    basename in the file's own folder). Conflicts = two sources → same dest, or
+    dest already exists on disk as a different file.
     """
     entries = []
     for track in tracks:
@@ -381,6 +530,55 @@ def build_organize_plan(tracks, mode, target_root, pattern):
         elif e["dest"].exists() and str(e["dest"]) not in src_set:
             e["conflict"] = True  # a pre-existing, unrelated file is in the way
     return entries
+
+
+# ── Duplicate detection ───────────────────────────────────────────────────────
+
+DUP_MODES = [
+    ("artist_title", "Same tags (Artist + Title)"),
+    ("artist_title_album", "Same tags (Artist + Title + Album)"),
+    ("content", "Identical file content"),
+]
+
+
+def dup_key(track: dict, mode: str):
+    """Grouping key for a track, or None if it can't be grouped in this mode."""
+    e = track["edited"]
+    g = lambda k: (e.get(k) or "").strip().lower()
+    if mode == "artist_title_album":
+        title = g("title")
+        return (g("artist") or g("albumartist"), title, g("album")) if title else None
+    # default: artist + title
+    title = g("title")
+    return (g("artist") or g("albumartist"), title) if title else None
+
+
+def file_hash(path, chunk=1 << 20) -> str:
+    h = hashlib.sha1()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def count_filled_tags(track: dict) -> int:
+    return sum(1 for f in FIELDS if (track["edited"].get(f) or "").strip())
+
+
+def pick_keeper(tracks: list, indices: list) -> int:
+    """Choose which duplicate to keep: most tags, then largest file, then
+    shortest path. Returns an index into `tracks`."""
+    def score(i):
+        t = tracks[i]
+        try:
+            size = t["path"].stat().st_size
+        except OSError:
+            size = 0
+        return (count_filled_tags(t), size, -len(str(t["path"])))
+    return max(indices, key=score)
 
 
 def remove_empty_dirs(root: Path):
@@ -499,24 +697,28 @@ class ApplyWorker(QThread):
 
 
 class OrganizeWorker(QThread):
-    """Moves/renames files per a plan, then optionally removes empty folders.
+    """Moves/copies/renames files per a plan, then optionally removes empty dirs.
 
     plan: list of {src, dest, changed, conflict}. Only changed, non-conflict
-    entries are executed. Emits the reverse (dest→src) moves for undo.
+    entries are executed. Emits tagged undo records:
+      ('move', new_path, old_src)  — reverse by moving back
+      ('delete', new_path, None)   — reverse by deleting the copy
     """
     progress = pyqtSignal(int, int)
-    finished = pyqtSignal(int, list, list, int)  # moved, errors, undo_moves, dirs_removed
+    finished = pyqtSignal(int, list, list, int)  # done, errors, undo_records, dirs_removed
 
-    def __init__(self, plan, remove_empty=False, source_root=None):
+    def __init__(self, plan, mode="move", remove_empty=False, source_root=None):
         super().__init__()
         self.plan = plan
+        self.mode = mode
         self.remove_empty = remove_empty
         self.source_root = source_root
 
     def run(self):
         errors = []
-        undo_moves = []
-        moved = 0
+        undo_records = []
+        done = 0
+        is_copy = self.mode == "copy"
         todo = [e for e in self.plan if e["changed"] and not e["conflict"]]
         for i, e in enumerate(todo):
             self.progress.emit(i + 1, len(todo))
@@ -529,39 +731,85 @@ class OrganizeWorker(QThread):
                     while final.exists():
                         final = final.parent / f"{stem} ({n}){suffix}"
                         n += 1
-                shutil.move(str(src), str(final))
-                undo_moves.append((str(final), str(src)))
-                moved += 1
+                if is_copy:
+                    shutil.copy2(str(src), str(final))
+                    undo_records.append(("delete", str(final), None))
+                else:
+                    shutil.move(str(src), str(final))
+                    undo_records.append(("move", str(final), str(src)))
+                done += 1
             except Exception as ex:
                 errors.append((str(src), str(ex)))
 
         dirs_removed = 0
-        if self.remove_empty and self.source_root:
+        if not is_copy and self.remove_empty and self.source_root:
             dirs_removed = remove_empty_dirs(Path(self.source_root))
-        self.finished.emit(moved, errors, undo_moves, dirs_removed)
+        self.finished.emit(done, errors, undo_records, dirs_removed)
 
 
-class UndoMovesWorker(QThread):
-    """Reverses a list of (from, to) moves recorded by OrganizeWorker."""
+class UndoWorker(QThread):
+    """Reverses OrganizeWorker records: move-backs and copy-deletes."""
     progress = pyqtSignal(int, int)
     finished = pyqtSignal(int, list)   # restored, errors
 
-    def __init__(self, moves):
+    def __init__(self, records):
         super().__init__()
-        self.moves = moves
+        self.records = records
 
     def run(self):
         errors = []
         restored = 0
-        for i, (frm, to) in enumerate(self.moves):
-            self.progress.emit(i + 1, len(self.moves))
+        for i, rec in enumerate(self.records):
+            self.progress.emit(i + 1, len(self.records))
+            kind = rec[0]
             try:
-                Path(to).parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(frm), str(to))
+                if kind == "move":
+                    Path(rec[2]).parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(rec[1]), str(rec[2]))
+                elif kind == "delete":
+                    p = Path(rec[1])
+                    if p.exists():
+                        p.unlink()
                 restored += 1
             except Exception as ex:
-                errors.append((str(frm), str(ex)))
+                errors.append((str(rec[1]), str(ex)))
         self.finished.emit(restored, errors)
+
+
+class DuplicateScanWorker(QThread):
+    """Groups tracks into duplicate sets by tags or by file content."""
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(list)   # groups: list of [track_index, ...] with len > 1
+
+    def __init__(self, tracks, mode):
+        super().__init__()
+        self.tracks = tracks
+        self.mode = mode
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        groups = {}
+        n = len(self.tracks)
+        for i, t in enumerate(self.tracks):
+            if self._stop:
+                self.finished.emit([])
+                return
+            self.progress.emit(i + 1, n)
+            if self.mode == "content":
+                try:
+                    key = file_hash(t["path"])
+                except Exception:
+                    continue
+            else:
+                key = dup_key(t, self.mode)
+                if key is None:
+                    continue
+            groups.setdefault(key, []).append(i)
+        dupes = [idxs for idxs in groups.values() if len(idxs) > 1]
+        self.finished.emit(dupes)
 
 
 # ── Tree branch arrow icons (generated at runtime, no asset files) ────────────
@@ -738,9 +986,16 @@ class MainWindow(QMainWindow):
 
         # Organize tab state
         self._organize_worker: Optional[OrganizeWorker] = None
-        self._org_undo_worker: Optional[UndoMovesWorker] = None
+        self._org_undo_worker: Optional[UndoWorker] = None
         self._organize_plan = []
-        self._org_undo_moves = []
+        self._org_undo_records = []
+
+        # Duplicates tab state
+        self._dup_worker: Optional[DuplicateScanWorker] = None
+        self._dup_move_worker: Optional[OrganizeWorker] = None
+        self._dup_undo_worker: Optional[UndoWorker] = None
+        self._dup_groups = []            # [{'indices':[...], 'keep': idx}]
+        self._dup_undo_records = []
 
         self._build_ui()
         self._set_controls_enabled(False)
@@ -755,20 +1010,25 @@ class MainWindow(QMainWindow):
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        outer = QVBoxLayout(central)
+        outer.setSpacing(8)
+        outer.setContentsMargins(10, 10, 10, 10)
+
+        # Shared source bar — visible above every tab so the folder can be
+        # changed or cleared at any time, from any tab.
+        outer.addWidget(self._build_source_bar())
+
         self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
         self.tabs.addTab(self._build_tags_tab(), "Tags")
         self.tabs.addTab(self._build_organize_tab(), "Organize")
+        self.tabs.addTab(self._build_duplicates_tab(), "Duplicates")
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        outer.addWidget(self.tabs, stretch=1)
         self.statusBar().showMessage("Select a folder to get started.")
 
-    def _build_tags_tab(self):
-        central = QWidget()
-        root = QVBoxLayout(central)
-        root.setSpacing(8)
-        root.setContentsMargins(10, 10, 10, 10)
-
-        # Source row
+    def _build_source_bar(self):
         source_group = QGroupBox("Source Directory")
         source_layout = QHBoxLayout(source_group)
         self.path_edit = QLineEdit()
@@ -776,8 +1036,13 @@ class MainWindow(QMainWindow):
         self.path_edit.setReadOnly(True)
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse)
+        self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setToolTip("Forget the current folder and reset all tabs")
+        self.clear_btn.clicked.connect(self._clear_source)
+        self.clear_btn.setEnabled(False)
         source_layout.addWidget(self.path_edit)
         source_layout.addWidget(browse_btn)
+        source_layout.addWidget(self.clear_btn)
         if sys.platform.startswith("linux"):
             self.mount_btn = QPushButton("Mount NAS…"); self.mount_btn.clicked.connect(self._mount_nas)
             self.unmount_btn = QPushButton("Unmount"); self.unmount_btn.clicked.connect(self._unmount_nas)
@@ -787,7 +1052,13 @@ class MainWindow(QMainWindow):
         else:
             self.mount_btn = QPushButton(); self.mount_btn.hide()
             self.unmount_btn = QPushButton(); self.unmount_btn.hide()
-        root.addWidget(source_group)
+        return source_group
+
+    def _build_tags_tab(self):
+        central = QWidget()
+        root = QVBoxLayout(central)
+        root.setSpacing(8)
+        root.setContentsMargins(10, 10, 10, 10)
 
         # Bulk-edit row
         bulk_group = QGroupBox("Bulk Edit  —  set a field on all selected rows")
@@ -946,6 +1217,7 @@ class MainWindow(QMainWindow):
         row1.addWidget(QLabel("Operation:"))
         self.org_mode = QComboBox()
         self.org_mode.addItem("Move into folder structure", "move")
+        self.org_mode.addItem("Copy into folder structure", "copy")
         self.org_mode.addItem("Rename in place", "rename")
         self.org_mode.setFixedWidth(220)
         self.org_mode.currentIndexChanged.connect(self._on_org_mode_changed)
@@ -970,8 +1242,11 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.org_pattern)
         opts_lay.addLayout(row2)
 
-        tokens = QLabel("Tokens: " + "  ".join(PATTERN_TOKENS)
-                        + "   ·   '/' starts a new subfolder. The file extension is kept automatically.")
+        tokens = QLabel(
+            "Tokens: " + "  ".join(PATTERN_TOKENS)
+            + "\nFunctions: " + "  ".join(PATTERN_FUNCS)
+            + "\n'/' starts a subfolder · [ … ] is dropped when its fields are empty"
+            " · 'text' is literal · the file extension is kept automatically.")
         tokens.setObjectName("statsLabel")
         tokens.setWordWrap(True)
         opts_lay.addWidget(tokens)
@@ -1033,11 +1308,11 @@ class MainWindow(QMainWindow):
 
     def _on_org_mode_changed(self, *_):
         mode = self.org_mode.currentData()
-        is_move = mode == "move"
-        self.org_target_label.setVisible(is_move)
-        self.org_target_edit.setVisible(is_move)
-        self.org_target_btn.setVisible(is_move)
-        self.org_remove_empty.setEnabled(is_move)
+        needs_target = mode in ("move", "copy")
+        self.org_target_label.setVisible(needs_target)
+        self.org_target_edit.setVisible(needs_target)
+        self.org_target_btn.setVisible(needs_target)
+        self.org_remove_empty.setEnabled(mode == "move")
         self._rebuild_organize_preview()
 
     def _browse_org_target(self):
@@ -1059,7 +1334,7 @@ class MainWindow(QMainWindow):
             self.org_stats.setText("Scan a folder on the Tags tab first.")
             self.org_run_btn.setEnabled(False)
             return
-        if mode == "move" and not target:
+        if mode in ("move", "copy") and not target:
             self.org_table.setRowCount(0)
             self.org_stats.setText("Choose a destination folder.")
             self.org_run_btn.setEnabled(False)
@@ -1084,7 +1359,8 @@ class MainWindow(QMainWindow):
                 new_disp = "(no change)"
             else:
                 try:
-                    new_disp = str(e["dest"].relative_to(target)) if mode == "move" else e["dest"].name
+                    new_disp = (str(e["dest"].relative_to(target))
+                                if mode in ("move", "copy") else e["dest"].name)
                 except (ValueError, TypeError):
                     new_disp = str(e["dest"])
             cur_item = QTableWidgetItem(cur)
@@ -1103,7 +1379,8 @@ class MainWindow(QMainWindow):
             elif e["changed"]:
                 changed += 1
 
-        stat = f"{changed} to {'rename' if mode == 'rename' else 'move'}  |  {len(self._organize_plan) - changed - conflicts} unchanged"
+        verb = {"rename": "rename", "copy": "copy"}.get(mode, "move")
+        stat = f"{changed} to {verb}  |  {len(self._organize_plan) - changed - conflicts} unchanged"
         if conflicts:
             stat += f"  |  ⚠ {conflicts} conflict(s)"
         self.org_stats.setText(stat)
@@ -1115,9 +1392,9 @@ class MainWindow(QMainWindow):
         if not todo:
             return
         mode = self.org_mode.currentData()
-        verb = "rename" if mode == "rename" else "move"
+        verb = {"rename": "rename", "copy": "copy"}.get(mode, "move")
         msg = (f"{verb.capitalize()} {len(todo)} file(s) using the pattern?\n\n"
-               "This changes where your files live on disk. You can undo this "
+               "This changes files on disk. You can undo this "
                "immediately afterward with 'Undo Last Organize'.\n\nContinue?")
         reply = QMessageBox.question(
             self, "Confirm Organize", msg,
@@ -1132,7 +1409,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{verb.capitalize()}ing files…")
 
         self._organize_worker = OrganizeWorker(
-            self._organize_plan, remove_empty=remove_empty,
+            self._organize_plan, mode=mode, remove_empty=remove_empty,
             source_root=self.music_dir)
         self._organize_worker.progress.connect(self._on_org_progress)
         self._organize_worker.finished.connect(self._on_organize_finished)
@@ -1142,13 +1419,14 @@ class MainWindow(QMainWindow):
         self.org_progress.setMaximum(total)
         self.org_progress.setValue(done)
 
-    def _on_organize_finished(self, moved, errors, undo_moves, dirs_removed):
+    def _on_organize_finished(self, done, errors, undo_records, dirs_removed):
         self.org_progress.setVisible(False)
-        self._org_undo_moves = undo_moves
-        self.org_undo_btn.setEnabled(bool(undo_moves))
+        self._org_undo_records = undo_records
+        self.org_undo_btn.setEnabled(bool(undo_records))
 
-        # Update the in-memory library so paths reflect their new homes.
-        moved_map = {frm_to[1]: frm_to[0] for frm_to in undo_moves}  # old_src -> new_path
+        # For moves/renames, update in-memory paths to their new homes.
+        # (Copy leaves originals in place, so paths don't change.)
+        moved_map = {rec[2]: rec[1] for rec in undo_records if rec[0] == "move"}
         for track in self.tracks:
             newp = moved_map.get(str(track["path"]))
             if newp:
@@ -1160,18 +1438,21 @@ class MainWindow(QMainWindow):
         if errors:
             et = "\n".join(f"  {p}: {m}" for p, m in errors[:20])
             QMessageBox.warning(self, "Organize done with errors",
-                                f"Processed {moved} file(s).\n\n{len(errors)} error(s):\n{et}{extra}")
+                                f"Processed {done} file(s).\n\n{len(errors)} error(s):\n{et}{extra}")
         else:
             QMessageBox.information(self, "Organize complete",
-                                    f"Successfully processed {moved} file(s).{extra}")
-        self.statusBar().showMessage(f"Organize complete — {moved} file(s).")
+                                    f"Successfully processed {done} file(s).{extra}")
+        self.statusBar().showMessage(f"Organize complete — {done} file(s).")
 
     def _undo_last_organize(self):
-        if not self._org_undo_moves:
+        if not self._org_undo_records:
             return
+        is_copy = self._org_undo_records[0][0] == "delete"
+        prompt = (f"Delete the {len(self._org_undo_records)} copied file(s)?"
+                  if is_copy else
+                  f"Move {len(self._org_undo_records)} file(s) back to their previous locations?")
         reply = QMessageBox.question(
-            self, "Undo Last Organize",
-            f"Move {len(self._org_undo_moves)} file(s) back to their previous locations?",
+            self, "Undo Last Organize", prompt,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -1179,19 +1460,19 @@ class MainWindow(QMainWindow):
         self.org_run_btn.setEnabled(False)
         self.org_progress.setVisible(True); self.org_progress.setValue(0)
         self.statusBar().showMessage("Undoing organize…")
-        self._org_undo_worker = UndoMovesWorker(list(self._org_undo_moves))
+        self._org_undo_worker = UndoWorker(list(self._org_undo_records))
         self._org_undo_worker.progress.connect(self._on_org_progress)
         self._org_undo_worker.finished.connect(self._on_org_undo_finished)
         self._org_undo_worker.start()
 
     def _on_org_undo_finished(self, restored, errors):
         self.org_progress.setVisible(False)
-        back_map = {frm: to for frm, to in self._org_undo_moves}  # new_path -> old_src
+        back_map = {rec[1]: rec[2] for rec in self._org_undo_records if rec[0] == "move"}
         for track in self.tracks:
             oldp = back_map.get(str(track["path"]))
             if oldp:
                 track["path"] = Path(oldp)
-        self._org_undo_moves = []
+        self._org_undo_records = []
         self._populate_table()
         self._rebuild_organize_preview()
         if errors:
@@ -1202,6 +1483,258 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Undo complete",
                                     f"Moved {restored} file(s) back.")
         self.statusBar().showMessage(f"Organize undo complete — {restored} file(s).")
+
+    # ── Duplicates tab ────────────────────────────────────────────────────────
+
+    KEEP_FG = QColor("#879a39")      # green 600-ish
+    DUP_FG = QColor("#d14d41")       # red 400
+
+    def _build_duplicates_tab(self):
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setSpacing(8)
+        root.setContentsMargins(10, 10, 10, 10)
+
+        find = QGroupBox("Find Duplicates")
+        find_lay = QHBoxLayout(find)
+        find_lay.addWidget(QLabel("Match by:"))
+        self.dup_mode = QComboBox()
+        for key, label in DUP_MODES:
+            self.dup_mode.addItem(label, key)
+        self.dup_mode.setFixedWidth(260)
+        find_lay.addWidget(self.dup_mode)
+        self.dup_find_btn = QPushButton("Find Duplicates")
+        self.dup_find_btn.clicked.connect(self._start_dup_scan)
+        find_lay.addWidget(self.dup_find_btn)
+        self.dup_keeper_btn = QPushButton("Keep Selected Instead")
+        self.dup_keeper_btn.setToolTip("Make the selected row the one kept in its group")
+        self.dup_keeper_btn.clicked.connect(self._set_selected_keeper)
+        self.dup_keeper_btn.setEnabled(False)
+        find_lay.addWidget(self.dup_keeper_btn)
+        find_lay.addStretch()
+        self.dup_stats = QLabel(""); self.dup_stats.setObjectName("statsLabel")
+        find_lay.addWidget(self.dup_stats)
+        root.addWidget(find)
+
+        self.dup_table = QTableWidget(0, 6)
+        self.dup_table.setHorizontalHeaderLabels(
+            ["Group", "Action", "File", "Artist", "Title", "Album"])
+        dhh = self.dup_table.horizontalHeader()
+        dhh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        dhh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        dhh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for c in (3, 4, 5):
+            dhh.setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
+            self.dup_table.setColumnWidth(c, 150)
+        self.dup_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.dup_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.dup_table.setAlternatingRowColors(True)
+        self.dup_table.verticalHeader().setVisible(False)
+        root.addWidget(self.dup_table, stretch=1)
+
+        dest_row = QHBoxLayout()
+        dest_row.addWidget(QLabel("Move duplicates to:"))
+        self.dup_quarantine = QLineEdit()
+        self.dup_quarantine.setPlaceholderText("Quarantine folder for the duplicates")
+        self.dup_quarantine.setReadOnly(True)
+        dest_row.addWidget(self.dup_quarantine)
+        dup_browse = QPushButton("Browse…")
+        dup_browse.clicked.connect(self._browse_quarantine)
+        dest_row.addWidget(dup_browse)
+        root.addLayout(dest_row)
+
+        bottom = QHBoxLayout()
+        self.dup_progress = QProgressBar()
+        self.dup_progress.setVisible(False); self.dup_progress.setFixedHeight(18)
+        bottom.addWidget(self.dup_progress)
+        bottom.addStretch()
+        self.dup_undo_btn = QPushButton("Undo Last")
+        self.dup_undo_btn.setFixedHeight(38); self.dup_undo_btn.setEnabled(False)
+        self.dup_undo_btn.clicked.connect(self._undo_dup_move)
+        bottom.addWidget(self.dup_undo_btn)
+        self.dup_move_btn = QPushButton("Quarantine Duplicates")
+        self.dup_move_btn.setFixedHeight(38); self.dup_move_btn.setFixedWidth(200)
+        self.dup_move_btn.setObjectName("applyBtn")
+        self.dup_move_btn.setEnabled(False)
+        self.dup_move_btn.clicked.connect(self._confirm_and_quarantine)
+        bottom.addWidget(self.dup_move_btn)
+        root.addLayout(bottom)
+
+        note = QLabel("Duplicates are moved to a quarantine folder (not deleted) so you "
+                      "can review before removing them. Undo moves them back.")
+        note.setObjectName("statsLabel"); note.setWordWrap(True)
+        root.addWidget(note)
+        return page
+
+    def _start_dup_scan(self):
+        if not self.tracks:
+            QMessageBox.information(self, "No tracks",
+                                    "Scan a folder on the Tags tab first.")
+            return
+        mode = self.dup_mode.currentData()
+        self.dup_find_btn.setEnabled(False)
+        self.dup_move_btn.setEnabled(False)
+        self.dup_keeper_btn.setEnabled(False)
+        self.dup_progress.setVisible(True); self.dup_progress.setValue(0)
+        self.statusBar().showMessage("Scanning for duplicates…")
+        self._dup_worker = DuplicateScanWorker(self.tracks, mode)
+        self._dup_worker.progress.connect(self._on_dup_progress)
+        self._dup_worker.finished.connect(self._on_dup_scan_finished)
+        self._dup_worker.start()
+
+    def _on_dup_progress(self, done, total):
+        self.dup_progress.setMaximum(total)
+        self.dup_progress.setValue(done)
+
+    def _on_dup_scan_finished(self, groups):
+        self.dup_progress.setVisible(False)
+        self.dup_find_btn.setEnabled(True)
+        self._dup_groups = [{"indices": g, "keep": pick_keeper(self.tracks, g)}
+                            for g in groups]
+        if self.music_dir and not self.dup_quarantine.text():
+            self.dup_quarantine.setText(str(self.music_dir / "MusicOrganizer-Duplicates"))
+        self._populate_dup_table()
+        dup_count = sum(len(g["indices"]) - 1 for g in self._dup_groups)
+        self.statusBar().showMessage(
+            f"Found {len(self._dup_groups)} duplicate group(s), {dup_count} removable file(s).")
+
+    def _populate_dup_table(self):
+        self.dup_table.setRowCount(0)
+        self._dup_row_map = []   # row -> (group_i, track_idx)
+        shade = QColor("#161514")
+        removable = 0
+        for gi, group in enumerate(self._dup_groups):
+            keep = group["keep"]
+            for idx in group["indices"]:
+                row = self.dup_table.rowCount()
+                self.dup_table.insertRow(row)
+                self._dup_row_map.append((gi, idx))
+                t = self.tracks[idx]
+                e = t["edited"]
+                is_keep = idx == keep
+                if not is_keep:
+                    removable += 1
+                try:
+                    fdisp = str(t["path"].relative_to(self.music_dir)) if self.music_dir else t["path"].name
+                except ValueError:
+                    fdisp = str(t["path"])
+                cells = [str(gi + 1),
+                         "KEEP" if is_keep else "→ quarantine",
+                         fdisp, e.get("artist", ""), e.get("title", ""), e.get("album", "")]
+                for c, text in enumerate(cells):
+                    item = QTableWidgetItem(text)
+                    if gi % 2 == 1:
+                        item.setBackground(QBrush(shade))
+                    if c == 1:
+                        item.setForeground(QBrush(self.KEEP_FG if is_keep else self.DUP_FG))
+                    self.dup_table.setItem(row, c, item)
+
+        self.dup_stats.setText(
+            f"{len(self._dup_groups)} group(s)  |  {removable} to quarantine"
+            if self._dup_groups else "No duplicates found.")
+        self.dup_move_btn.setEnabled(removable > 0 and bool(self.dup_quarantine.text()))
+        self.dup_keeper_btn.setEnabled(bool(self._dup_groups))
+
+    def _set_selected_keeper(self):
+        rows = self.dup_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        gi, idx = self._dup_row_map[rows[0].row()]
+        self._dup_groups[gi]["keep"] = idx
+        self._populate_dup_table()
+
+    def _browse_quarantine(self):
+        start = self.dup_quarantine.text() or (str(self.music_dir) if self.music_dir else "")
+        path = QFileDialog.getExistingDirectory(self, "Select Quarantine Folder", start)
+        if path:
+            self.dup_quarantine.setText(path)
+            self.dup_move_btn.setEnabled(
+                any(len(g["indices"]) > 1 for g in self._dup_groups))
+
+    def _confirm_and_quarantine(self):
+        quarantine = self.dup_quarantine.text().strip()
+        if not quarantine:
+            return
+        plan = []
+        for group in self._dup_groups:
+            for idx in group["indices"]:
+                if idx == group["keep"]:
+                    continue
+                src = self.tracks[idx]["path"]
+                try:
+                    rel = src.relative_to(self.music_dir)
+                except (ValueError, TypeError):
+                    rel = Path(src.name)
+                plan.append({"src": src, "dest": Path(quarantine) / rel,
+                             "changed": True, "conflict": False})
+        if not plan:
+            return
+        reply = QMessageBox.question(
+            self, "Quarantine Duplicates",
+            f"Move {len(plan)} duplicate file(s) into:\n\n  {quarantine}\n\n"
+            "The chosen keeper in each group stays put. Undo moves them back. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.dup_move_btn.setEnabled(False)
+        self.dup_undo_btn.setEnabled(False)
+        self.dup_find_btn.setEnabled(False)
+        self.dup_progress.setVisible(True); self.dup_progress.setValue(0)
+        self.statusBar().showMessage("Quarantining duplicates…")
+        self._dup_move_worker = OrganizeWorker(plan, mode="move")
+        self._dup_move_worker.progress.connect(self._on_dup_progress)
+        self._dup_move_worker.finished.connect(self._on_dup_move_finished)
+        self._dup_move_worker.start()
+
+    def _on_dup_move_finished(self, moved, errors, undo_records, dirs_removed):
+        self.dup_progress.setVisible(False)
+        self.dup_find_btn.setEnabled(True)
+        self._dup_undo_records = undo_records
+        self.dup_undo_btn.setEnabled(bool(undo_records))
+
+        moved_map = {rec[2]: rec[1] for rec in undo_records if rec[0] == "move"}
+        for track in self.tracks:
+            newp = moved_map.get(str(track["path"]))
+            if newp:
+                track["path"] = Path(newp)
+        # Clear the resolved groups from view.
+        self._dup_groups = []
+        self._populate_dup_table()
+        self._populate_table()
+
+        if errors:
+            et = "\n".join(f"  {p}: {m}" for p, m in errors[:20])
+            QMessageBox.warning(self, "Quarantine done with errors",
+                                f"Moved {moved} file(s).\n\n{len(errors)} error(s):\n{et}")
+        else:
+            QMessageBox.information(self, "Duplicates quarantined",
+                                    f"Moved {moved} duplicate file(s) to the quarantine folder.")
+        self.statusBar().showMessage(f"Quarantined {moved} duplicate(s).")
+
+    def _undo_dup_move(self):
+        if not self._dup_undo_records:
+            return
+        self.dup_undo_btn.setEnabled(False)
+        self.dup_progress.setVisible(True); self.dup_progress.setValue(0)
+        self.statusBar().showMessage("Undoing quarantine…")
+        self._dup_undo_worker = UndoWorker(list(self._dup_undo_records))
+        self._dup_undo_worker.progress.connect(self._on_dup_progress)
+        self._dup_undo_worker.finished.connect(self._on_dup_undo_finished)
+        self._dup_undo_worker.start()
+
+    def _on_dup_undo_finished(self, restored, errors):
+        self.dup_progress.setVisible(False)
+        back_map = {rec[1]: rec[2] for rec in self._dup_undo_records if rec[0] == "move"}
+        for track in self.tracks:
+            oldp = back_map.get(str(track["path"]))
+            if oldp:
+                track["path"] = Path(oldp)
+        self._dup_undo_records = []
+        self._populate_table()
+        QMessageBox.information(self, "Undo complete",
+                                f"Moved {restored} file(s) back.")
+        self.statusBar().showMessage(f"Duplicate undo complete — {restored} file(s).")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1252,6 +1785,48 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Select Music Folder")
         if path:
             self._set_music_dir(Path(path))
+
+    def _busy(self) -> bool:
+        """True if any background worker is running (block reset while busy)."""
+        for w in (self._scan_worker, self._apply_worker, self._undo_worker,
+                  self._organize_worker, self._org_undo_worker,
+                  self._dup_worker, self._dup_move_worker, self._dup_undo_worker):
+            if w and w.isRunning():
+                return True
+        return False
+
+    def _clear_source(self):
+        if self._busy():
+            QMessageBox.warning(self, "Busy",
+                                "Wait for the current operation to finish first.")
+            return
+        if self.tracks and any(track_has_edits(t) for t in self.tracks):
+            reply = QMessageBox.question(
+                self, "Discard unsaved edits?",
+                "You have staged tag/art edits that haven't been applied.\n"
+                "Clearing the folder will discard them. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self.music_dir = None
+        self.tracks = []
+        self._undo_records = []
+        self._org_undo_records = []
+        self._dup_groups = []
+        self._dup_undo_records = []
+        self.path_edit.clear()
+        self.folder_tree.clear()
+        self._clear_table()
+        self.undo_btn.setEnabled(False)
+        self.org_undo_btn.setEnabled(False)
+        self.dup_undo_btn.setEnabled(False)
+        self.org_target_edit.clear()
+        self.dup_quarantine.clear()
+        self._rebuild_organize_preview()
+        self._populate_dup_table()
+        self._set_controls_enabled(False)
+        self.clear_btn.setEnabled(False)
+        self.statusBar().showMessage("Cleared — select a folder to get started.")
 
     def _mount_nas(self):
         dlg = MountDialog(self)
@@ -1309,13 +1884,20 @@ class MainWindow(QMainWindow):
         self.tracks = []
         self._undo_records = []
         self.undo_btn.setEnabled(False)
-        self._org_undo_moves = []
+        self._org_undo_records = []
         self.org_undo_btn.setEnabled(False)
         self.org_target_edit.setText(str(path))
+        self._dup_groups = []
+        self._dup_undo_records = []
+        self.dup_undo_btn.setEnabled(False)
+        self.dup_quarantine.setText(str(path / "MusicOrganizer-Duplicates"))
+        if hasattr(self, "dup_table"):
+            self._populate_dup_table()
         self._populate_folder_tree()
         self._clear_table()
         self._rebuild_organize_preview()
         self._set_controls_enabled(True)
+        self.clear_btn.setEnabled(True)
         self.statusBar().showMessage("Ready — click Scan Music to begin.")
 
     # ── Folder tree ───────────────────────────────────────────────────────────
@@ -1425,6 +2007,9 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Found {len(tracks)} tracks. Edit tags below.")
         self._populate_table()
         self._rebuild_organize_preview()
+        self._dup_groups = []
+        if hasattr(self, "dup_table"):
+            self._populate_dup_table()
 
     def _on_scan_error(self, msg):
         self.progress.setVisible(False)
