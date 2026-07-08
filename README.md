@@ -8,7 +8,11 @@ table, and either write tag changes in place or move/rename files by a pattern.
 Built with PyQt6 and [mutagen](https://mutagen.readthedocs.io/), themed with
 [Flexoki](https://stephango.com/flexoki).
 
-![Music Organizer main window](docs/screenshot.png)
+Main Window - Metadata Tags
+![Music Organizer main window](docs/Screenshot_Tags.png)
+
+Organize (file operations)
+![Music Organizer second window](docs/Screenshot_Organize.png)
 
 ## Features
 
