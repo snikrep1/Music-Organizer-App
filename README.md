@@ -14,6 +14,9 @@ Main Window - Metadata Tags
 Organize (file operations)
 ![Music Organizer second window](docs/Screenshot_Organize.png)
 
+Duplicates 
+![Music Organizer third window](docs/Screenshot_Duplicates.png)
+
 ## Features
 
 - **Editable table** — every tag field is editable inline (double-click a cell).
