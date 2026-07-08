@@ -51,9 +51,17 @@ jobs:
       - name: Build
         run: python build.py
 
-      - name: Zip .app bundle (macOS)
+      # Package the .app with `ditto`, NOT `zip`. A macOS .app contains
+      # framework symlinks and a code-signature seal (PyInstaller ad-hoc signs
+      # it at build time); plain `zip -r` mangles the symlinks and dotted dirs,
+      # which invalidates the signature and crashes Qt at launch with a PAC
+      # fault. `ditto` is bundle-aware and preserves all of it.
+      - name: Verify signature then package .app (macOS)
         if: runner.os == 'macOS'
-        run: cd dist && zip -r MusicOrganizer-macos.zip MusicOrganizer.app
+        run: |
+          codesign --verify --verbose=2 dist/MusicOrganizer.app || true
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent MusicOrganizer.app MusicOrganizer-macos.zip
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
